@@ -132,6 +132,9 @@ async def status_poll_loop(bot: Bot) -> None:
                 for user_id, thread_id, wid in list(
                     session_manager.iter_thread_bindings()
                 ):
+                    # Skip topic probe for DM bindings (no forum topics)
+                    if thread_id == 0:
+                        continue
                     try:
                         await bot.unpin_all_forum_topic_messages(
                             chat_id=session_manager.resolve_chat_id(user_id, thread_id),

@@ -184,9 +184,9 @@ async def handle_interactive_ui(
     # Send as plain text (no markdown conversion)
     text = content.content
 
-    # Build thread kwargs for send_message
+    # Build thread kwargs for send_message (skip for DM sentinel thread_id=0)
     thread_kwargs: dict[str, int] = {}
-    if thread_id is not None:
+    if thread_id is not None and thread_id != 0:
         thread_kwargs["message_thread_id"] = thread_id
 
     # Check if we have an existing interactive message to edit

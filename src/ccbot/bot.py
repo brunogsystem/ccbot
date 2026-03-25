@@ -161,13 +161,29 @@ def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
 
 
+DM_THREAD_ID = 0
+"""Sentinel thread_id for private (DM) chats.
+
+DMs have no forum topics, so we use 0 as a synthetic thread_id to reuse
+the existing thread_bindings infrastructure.  Telegram forum topic IDs
+start at 1 (General) and go up, so 0 never collides.
+"""
+
+
 def _get_thread_id(update: Update) -> int | None:
-    """Extract thread_id from an update, returning None if not in a named topic."""
+    """Extract thread_id from an update, returning None if not in a named topic.
+
+    For private (DM) chats, returns DM_THREAD_ID so that DMs can be routed
+    through the same thread_bindings infrastructure used by forum topics.
+    """
     msg = update.message or (
         update.callback_query.message if update.callback_query else None
     )
     if msg is None:
         return None
+    # Private chats use DM_THREAD_ID sentinel (no forum topics)
+    if msg.chat.type == "private":
+        return DM_THREAD_ID
     tid = getattr(msg, "message_thread_id", None)
     if tid is None or tid == 1:
         return None
@@ -187,11 +203,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     clear_browse_state(context.user_data)
 
     if update.message:
-        await safe_reply(
-            update.message,
-            "🤖 *Claude Code Monitor*\n\n"
-            "Each topic is a session. Create a new topic to start.",
-        )
+        chat = update.effective_chat
+        if chat and chat.type == "private":
+            await safe_reply(
+                update.message,
+                "🤖 *Claude Code Monitor*\n\n"
+                "Send a message to start or bind a session.",
+            )
+        else:
+            await safe_reply(
+                update.message,
+                "🤖 *Claude Code Monitor*\n\n"
+                "Each topic is a session. Create a new topic to start.",
+            )
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -763,11 +787,14 @@ async def _capture_bash_output(
 
             if msg_id is None:
                 # First capture — send a new message
+                kwargs: dict[str, int] = {}
+                if thread_id != DM_THREAD_ID:
+                    kwargs["message_thread_id"] = thread_id
                 sent = await send_with_fallback(
                     bot,
                     chat_id,
                     output,
-                    message_thread_id=thread_id,
+                    **kwargs,
                 )
                 if sent:
                     msg_id = sent.message_id
@@ -895,6 +922,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
         if unbound:
+            # DM convenience: auto-bind when exactly 1 unbound window
+            if thread_id == DM_THREAD_ID and len(unbound) == 1:
+                auto_wid, auto_wname, _auto_cwd = unbound[0]
+                session_manager.bind_thread(
+                    user.id, DM_THREAD_ID, auto_wid, window_name=auto_wname
+                )
+                logger.info(
+                    "DM auto-bind: window %s (%s) for user %d",
+                    auto_wid,
+                    auto_wname,
+                    user.id,
+                )
+                await safe_reply(
+                    update.message,
+                    f"✅ Auto-bound to `{auto_wname}`",
+                )
+                # Forward the original text
+                await update.message.chat.send_action(ChatAction.TYPING)
+                success, message = await session_manager.send_to_window(auto_wid, text)
+                if not success:
+                    await safe_reply(update.message, f"❌ {message}")
+                return
+
             # Show window picker
             logger.info(
                 "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
@@ -1063,16 +1113,17 @@ async def _create_and_bind_window(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            # Rename the topic to match the window name
             resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
-            try:
-                await context.bot.edit_forum_topic(
-                    chat_id=resolved_chat,
-                    message_thread_id=pending_thread_id,
-                    name=created_wname,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to rename topic: {e}")
+            # Rename the topic to match the window name (skip for DMs — no topics)
+            if pending_thread_id != DM_THREAD_ID:
+                try:
+                    await context.bot.edit_forum_topic(
+                        chat_id=resolved_chat,
+                        message_thread_id=pending_thread_id,
+                        name=created_wname,
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to rename topic: {e}")
 
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
@@ -1101,11 +1152,15 @@ async def _create_and_bind_window(
                 )
                 if not send_ok:
                     logger.warning("Failed to forward pending text: %s", send_msg)
+                    # DM_THREAD_ID → no message_thread_id for private chats
+                    send_tid = (
+                        pending_thread_id if pending_thread_id != DM_THREAD_ID else None
+                    )
                     await safe_send(
                         context.bot,
                         resolved_chat,
                         f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
+                        message_thread_id=send_tid,
                     )
             elif context.user_data is not None:
                 context.user_data.pop("_pending_thread_id", None)
@@ -1461,16 +1516,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user.id, thread_id, selected_wid, window_name=display
         )
 
-        # Rename the topic to match the window name
+        # Rename the topic to match the window name (skip for DMs — no topics)
         resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
-        try:
-            await context.bot.edit_forum_topic(
-                chat_id=resolved_chat,
-                message_thread_id=thread_id,
-                name=display,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to rename topic: {e}")
+        if thread_id != DM_THREAD_ID:
+            try:
+                await context.bot.edit_forum_topic(
+                    chat_id=resolved_chat,
+                    message_thread_id=thread_id,
+                    name=display,
+                )
+            except Exception as e:
+                logger.debug(f"Failed to rename topic: {e}")
 
         await safe_edit(
             query,
@@ -1768,7 +1824,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
         parts = build_response_parts(

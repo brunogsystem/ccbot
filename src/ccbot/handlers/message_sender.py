@@ -176,7 +176,8 @@ async def safe_send(
 ) -> None:
     """Send message with formatting, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    if message_thread_id is not None:
+    # Skip message_thread_id for DM chats (sentinel value 0) and None
+    if message_thread_id is not None and message_thread_id != 0:
         kwargs.setdefault("message_thread_id", message_thread_id)
     try:
         await bot.send_message(
